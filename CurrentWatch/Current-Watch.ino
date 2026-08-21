@@ -1,20 +1,11 @@
 /*
   CurrentWatch ESP8266 -> Render API heartbeat client
-  RELIABLE + NON-BLOCKING WIFI RECONNECT VERSION
-
-  Behavior:
-  - No heartbeat retry-count limit.
-  - HTTP attempts are short-fail and immediately retried.
-  - On HTTP failure/timeout:
-      -> close HTTP
-      -> trigger WiFi reconnect
-      -> do NOT block for 1+ seconds
-      -> retry as soon as WiFi is connected
-  - 5000 ms is ONLY the desired SUCCESS TARGET.
-  - It is NOT a hard timeout.
-  - Retries continue until a heartbeat succeeds.
-  - WiFi reconnect is handled without a blocking reconnect loop.
-  - Existing electricity/current code remains independent.
+  FORENSIC DEBUG VERSION
+  - Heartbeat schedule: 500ms
+  const char* WIFI_SSID = "দীয়া বাবু";
+const char* WIFI_PASSWORD = "OOOOOOOO";
+  - WiFi modem sleep: disabled for lower latency/jitter
+  - Auto reconnect: enabled
 */
 
 #include <Arduino.h>
@@ -31,36 +22,14 @@ const char* CURRENTWATCH_API =
 const char* DEVICE_API_KEY = "Rifat6677";
 const char* DEVICE_ID = "currentwatch-01";
 
-// ------------------------------------------------------------
-// HEARTBEAT SETTINGS
-// ------------------------------------------------------------
+const unsigned long HEARTBEAT_INTERVAL_MS = 10;
 
-// Maximum time for ONE HTTP attempt.
-const unsigned long HTTP_TIMEOUT_MS = 100UL;
-
-// Desired time to successfully complete a heartbeat.
-// NOT a hard stop.
-const unsigned long HEARTBEAT_SUCCESS_TARGET_MS = 5000UL;
-
-// Heartbeat schedule.
-const unsigned long HEARTBEAT_INTERVAL_MS = 10UL;
-
-// No retry delay.
-const unsigned long RETRY_DELAY_MS = 0UL;
-
-// WiFi reconnect trigger spacing.
-// Prevents WiFi.begin() from being hammered continuously.
-const unsigned long WIFI_RECONNECT_RETRY_MS = 1000UL;
-
-// Initial WiFi connection is allowed more time.
-const unsigned long INITIAL_WIFI_TIMEOUT_MS = 15000UL;
+// Safety limit for a single HTTPS request.
+// This prevents one request from blocking the ESP for 37+ seconds.
+const unsigned long HTTP_TIMEOUT_MS = 12000;
 
 unsigned long lastHeartbeatMs = 0;
-unsigned long lastWiFiReconnectTriggerMs = 0;
-
 bool apiReady = false;
-bool heartbeatRunning = false;
-bool heartbeatWaitingForWiFi = false;
 
 // ------------------------------------------------------------
 // FORENSIC SERIAL LOGGING
@@ -82,7 +51,7 @@ void logLine(const String& text) {
 void printWiFiState(const char* prefix) {
   printTimestamp();
   Serial.print(prefix);
-  Serial.print("WiFi=");
+  Serial.print(" WiFi=");
 
   wl_status_t status = WiFi.status();
 
@@ -90,23 +59,18 @@ void printWiFiState(const char* prefix) {
     case WL_CONNECTED:
       Serial.print("CONNECTED");
       break;
-
     case WL_NO_SSID_AVAIL:
       Serial.print("NO_SSID");
       break;
-
     case WL_CONNECT_FAILED:
       Serial.print("CONNECT_FAILED");
       break;
-
     case WL_CONNECTION_LOST:
       Serial.print("CONNECTION_LOST");
       break;
-
     case WL_DISCONNECTED:
       Serial.print("DISCONNECTED");
       break;
-
     default:
       Serial.print("STATUS_");
       Serial.print((int)status);
@@ -132,140 +96,108 @@ WiFiEventHandler wifiDisconnectHandler;
 
 void onWiFiConnect(const WiFiEventStationModeConnected& event) {
   logLine("WIFI EVENT: CONNECTED TO AP");
-
-  heartbeatWaitingForWiFi = false;
 }
 
 void onWiFiDisconnect(const WiFiEventStationModeDisconnected& event) {
   printTimestamp();
   Serial.print("WIFI EVENT: DISCONNECTED | reason=");
   Serial.println((int)event.reason);
-
-  apiReady = false;
 }
 
 // ------------------------------------------------------------
-// WIFI CONFIGURATION
+// WIFI CONNECTION
 // ------------------------------------------------------------
 
-void configureWiFi() {
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  logLine("WIFI CONNECTION REQUIRED");
+  Serial.print("Connecting WiFi");
+
   WiFi.mode(WIFI_STA);
 
-  // Disable modem sleep for lower latency/jitter.
+  // Stability-oriented ESP8266 WiFi settings.
+  // Disable modem sleep to reduce WiFi latency/jitter.
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
 
-  // Use the ESP8266's highest normal transmit-power setting.
-  // This does not magically improve the router/ISP signal, but it gives
-  // the ESP the strongest supported outgoing WiFi transmission.
-  WiFi.setOutputPower(20.5f);
-
-  // Let ESP8266 automatically recover from AP loss.
+  // Let the ESP automatically reconnect if the AP connection drops.
   WiFi.setAutoReconnect(true);
 
-  // Do not repeatedly write credentials/settings to flash.
+  // Avoid writing WiFi credentials/settings to flash repeatedly.
   WiFi.persistent(false);
-}
-
-// ------------------------------------------------------------
-// NON-BLOCKING WIFI RECONNECT TRIGGER
-// ------------------------------------------------------------
-
-void requestWiFiReconnect() {
-  unsigned long now = millis();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    heartbeatWaitingForWiFi = false;
-    return;
-  }
-
-  // Do not call WiFi.begin() repeatedly every few milliseconds.
-  if (now - lastWiFiReconnectTriggerMs < WIFI_RECONNECT_RETRY_MS) {
-    return;
-  }
-
-  lastWiFiReconnectTriggerMs = now;
-
-  logLine("WIFI RECONNECT TRIGGER");
-
-  configureWiFi();
-
-  /*
-    This starts/restarts the connection attempt but does NOT wait here.
-    The loop remains free to run the electricity/current logic.
-  */
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  heartbeatWaitingForWiFi = true;
-}
-
-// ------------------------------------------------------------
-// INITIAL WIFI CONNECTION
-// ------------------------------------------------------------
-
-bool connectWiFiInitial() {
-  configureWiFi();
-
-  logLine("INITIAL WIFI CONNECTION START");
 
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long started = millis();
 
   while (WiFi.status() != WL_CONNECTED &&
-         millis() - started < INITIAL_WIFI_TIMEOUT_MS) {
-    delay(100);
-    yield();
+         millis() - started < 15000UL) {
+    delay(250);
+    Serial.print(".");
   }
+
+  Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    printWiFiState("WIFI CONNECTED: ");
-    heartbeatWaitingForWiFi = false;
-    return true;
+    printWiFiState("WIFI CONNECTED:");
+  } else {
+    logLine("WIFI CONNECTION FAILED AFTER 15 SECONDS");
+    printWiFiState("WIFI STATE:");
   }
-
-  logLine("INITIAL WIFI CONNECTION FAILED");
-  printWiFiState("WIFI STATE: ");
-
-  heartbeatWaitingForWiFi = true;
-  return false;
 }
 
 // ------------------------------------------------------------
-// ONE HTTP HEARTBEAT ATTEMPT
+// HEARTBEAT
 // ------------------------------------------------------------
 
-bool sendHeartbeatAttempt() {
-  unsigned long attemptStart = millis();
+bool sendCurrentWatchHeartbeat() {
+  unsigned long functionStart = millis();
 
-  printTimestamp();
-  Serial.println("HEARTBEAT HTTP ATTEMPT START");
+  logLine("HEARTBEAT START");
+  printWiFiState("BEFORE HTTP:");
 
   if (WiFi.status() != WL_CONNECTED) {
-    logLine("HTTP ATTEMPT SKIPPED: WIFI NOT CONNECTED");
-    return false;
+    apiReady = false;
+
+    logLine("HEARTBEAT ABORTED: WIFI NOT CONNECTED");
+
+    connectWiFi();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      logLine("HEARTBEAT ABORTED: WIFI RECONNECT FAILED");
+      return false;
+    }
   }
 
   WiFiClientSecure client;
-
-  // Same behavior as the original code.
   client.setInsecure();
-
-  // Underlying secure client timeout.
-  client.setTimeout(HTTP_TIMEOUT_MS);
 
   HTTPClient http;
 
-  // Maximum wait for this HTTP attempt.
+  // Prevent a stuck HTTPS request from blocking the ESP for tens of seconds.
   http.setTimeout(HTTP_TIMEOUT_MS);
+
+  logLine("HTTP BEGIN START");
+
+  unsigned long beginStart = millis();
 
   if (!http.begin(client, CURRENTWATCH_API)) {
     apiReady = false;
 
-    logLine("HTTP BEGIN FAILED");
+    printTimestamp();
+    Serial.print("HTTP BEGIN FAILED | duration=");
+    Serial.print(millis() - beginStart);
+    Serial.println(" ms");
 
-    http.end();
     return false;
   }
+
+  printTimestamp();
+  Serial.print("HTTP BEGIN OK | duration=");
+  Serial.print(millis() - beginStart);
+  Serial.println(" ms");
 
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Key", DEVICE_API_KEY);
@@ -276,18 +208,23 @@ bool sendHeartbeatAttempt() {
 
   logLine("HTTP POST START");
 
+  unsigned long postStart = millis();
+
   int httpCode = http.POST(body);
 
-  unsigned long duration = millis() - attemptStart;
+  unsigned long postDuration = millis() - postStart;
+  unsigned long totalDuration = millis() - functionStart;
 
   if (httpCode >= 200 && httpCode < 300) {
     apiReady = true;
 
     printTimestamp();
-    Serial.print("HEARTBEAT SUCCESS: HTTP=");
+    Serial.print("HEARTBEAT OK: ");
     Serial.print(httpCode);
-    Serial.print(" | HTTP_ATTEMPT=");
-    Serial.print(duration);
+    Serial.print(" | POST=");
+    Serial.print(postDuration);
+    Serial.print(" ms | TOTAL=");
+    Serial.print(totalDuration);
     Serial.print(" ms | RSSI=");
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -301,99 +238,33 @@ bool sendHeartbeatAttempt() {
     Serial.println(ESP.getFreeHeap());
 
     http.end();
-
     return true;
   }
 
   apiReady = false;
 
   printTimestamp();
-  Serial.print("HEARTBEAT HTTP FAILED: HTTP=");
+  Serial.print("HEARTBEAT FAILED: HTTP=");
   Serial.print(httpCode);
-  Serial.print(" | HTTP_ATTEMPT=");
-  Serial.print(duration);
+  Serial.print(" | POST=");
+  Serial.print(postDuration);
+  Serial.print(" ms | TOTAL=");
+  Serial.print(totalDuration);
   Serial.println(" ms");
 
   if (httpCode > 0) {
-    String response = http.getString();
-
     Serial.print("Response: ");
-    Serial.println(response);
+    Serial.println(http.getString());
   } else {
     Serial.print("HTTP Error: ");
     Serial.println(http.errorToString(httpCode));
   }
 
+  printWiFiState("AFTER HTTP:");
+
   http.end();
-
-  printWiFiState("AFTER FAILED HTTP: ");
-
   return false;
 }
-
-// ------------------------------------------------------------
-// RELIABLE HEARTBEAT
-// ------------------------------------------------------------
-
-bool sendReliableHeartbeat() {
-  heartbeatWaitingForWiFi = false;
-
-  unsigned long cycleStart = millis();
-  unsigned long attemptNumber = 0;
-
-  while (true) {
-    unsigned long now = millis();
-
-    if (WiFi.status() != WL_CONNECTED) {
-      apiReady = false;
-      heartbeatWaitingForWiFi = true;
-
-      requestWiFiReconnect();
-
-      // Keep the retry loop alive without a blocking reconnect wait.
-      delay(1);
-      yield();
-      continue;
-    }
-
-    heartbeatWaitingForWiFi = false;
-    attemptNumber++;
-
-    printTimestamp();
-    Serial.print("HEARTBEAT REQUEST #");
-    Serial.print(attemptNumber);
-    Serial.print(" | ELAPSED=");
-    Serial.print(millis() - cycleStart);
-    Serial.println(" ms");
-
-    if (sendHeartbeatAttempt()) {
-      unsigned long total = millis() - cycleStart;
-
-      printTimestamp();
-      Serial.print("HEARTBEAT SUCCESS | TOTAL=");
-      Serial.print(total);
-      Serial.println(" ms");
-
-      // Immediately start the next heartbeat cycle.
-      heartbeatRunning = false;
-      heartbeatWaitingForWiFi = false;
-      return true;
-    }
-
-    apiReady = false;
-
-    // NEVER stop after 5 seconds.
-    // NEVER stop after a fixed number of attempts.
-    // Keep requesting continuously for as long as necessary.
-    if (WiFi.status() != WL_CONNECTED) {
-      heartbeatWaitingForWiFi = true;
-      requestWiFiReconnect();
-    }
-
-    yield();
-  }
-}
-
 
 // ------------------------------------------------------------
 // HEARTBEAT SCHEDULER
@@ -408,9 +279,8 @@ void currentWatchLoop() {
 
   lastHeartbeatMs = now;
 
-  // No retry count and no "one request per heartbeat cycle" limit.
-  // Each cycle keeps requesting until a server response succeeds.
-  sendReliableHeartbeat();
+  // Keep the existing electricity/current logic independent.
+  sendCurrentWatchHeartbeat();
 }
 
 // ------------------------------------------------------------
@@ -429,8 +299,7 @@ void setup() {
 
   Serial.println();
   Serial.println("==============================================");
-  Serial.println("CurrentWatch ESP8266");
-  Serial.println("CURRENTWATCH CONTINUOUS HEARTBEAT");
+  Serial.println("CurrentWatch ESP8266 FORENSIC HEARTBEAT");
   Serial.println("==============================================");
 
   printTimestamp();
@@ -442,34 +311,20 @@ void setup() {
   Serial.println(ESP.getFreeHeap());
 
   printTimestamp();
-  Serial.print("HTTP ATTEMPT TIMEOUT: ");
-  Serial.print(HTTP_TIMEOUT_MS);
-  Serial.println(" ms");
-
-  printTimestamp();
-  Serial.print("SUCCESS TARGET: ");
-  Serial.print(HEARTBEAT_SUCCESS_TARGET_MS);
-  Serial.println(" ms");
-
-  printTimestamp();
-  Serial.print("WIFI RECONNECT TRIGGER: ");
-  Serial.print(WIFI_RECONNECT_RETRY_MS);
-  Serial.println(" ms");
-
-  printTimestamp();
-  Serial.print("HEARTBEAT INTERVAL: ");
+  Serial.print("HEARTBEAT SCHEDULE: ");
   Serial.print(HEARTBEAT_INTERVAL_MS);
   Serial.println(" ms");
 
-  if (connectWiFiInitial()) {
-    sendReliableHeartbeat();
+  printTimestamp();
+  Serial.print("HTTP TIMEOUT: ");
+  Serial.print(HTTP_TIMEOUT_MS);
+  Serial.println(" ms");
+
+  connectWiFi();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    sendCurrentWatchHeartbeat();
     lastHeartbeatMs = millis();
-  } else {
-    /*
-      We do not give up after initial WiFi failure.
-      The normal loop will continue trying.
-    */
-    requestWiFiReconnect();
   }
 }
 
